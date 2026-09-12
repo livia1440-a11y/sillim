@@ -41,8 +41,16 @@ DB_PATH = "photo_bot.db"
 # 매일 몇 시에 점검 메시지를 보낼지
 CHECK_HOUR, CHECK_MINUTE = 7, 0
 
+# 미션이 없는 요일 (Python weekday: 월=0, 화=1, 수=2, 목=3, 금=4, 토=5, 일=6)
+SKIP_WEEKDAYS = {1, 3, 5}  # 화, 목, 토 — 이 요일 몫은 점검하지 않음
+
 # 미업로드자 멘션 뒤에 붙일 멘트 (필요하면 이 문구만 수정하면 됩니다)
 MENTION_MESSAGE = "전도사님! 분반 자가피드백 올려주셔야 합니다!♡"
+
+# 자정 리마인드: 몇 시에 보낼지 / 어떤 문구를 보낼지 / 어떤 요일 다음날 자정에 보낼지
+REMINDER_HOUR, REMINDER_MINUTE = 0, 0
+REMINDER_MESSAGE = "전도사님들! 분반 자가 피드백 올려주세요❤️🙏🏻"
+REMINDER_WEEKDAYS = {0, 2, 4}  # 월, 수, 금 — 이 요일에서 다음날로 넘어가는 자정에 리마인드
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -195,13 +203,22 @@ async def on_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 # ─────────────────────────────────────────────
 async def check_and_mention(context: ContextTypes.DEFAULT_TYPE) -> None:
     """
-    '전날 오후 3시 ~ 오늘 오전 7시' 사이에
+    미션 요일: 월/수/금/일 (취침 전까지 이미지 업로드)
+    화/목/토는 미션이 없는 날이라 점검하지 않음
+
+    매일 아침 점검은 '어제' 몫을 확인하는 것이므로,
+    어제가 화/목/토(미션 없는 날)였다면 이번 점검은 건너뜀.
+    어제가 월/수/금/일이었다면 '전날 오후 3시 ~ 오늘 오전 7시' 구간에
     사진(이미지)을 한 장도 올리지 않은 활성 참가자를 멘션한다.
     동영상은 인정하지 않음 (photo 핸들러만 업로드로 기록하므로 자동으로 제외됨)
     """
     now = datetime.now(KST)
-    window_end = now.replace(hour=CHECK_HOUR, minute=CHECK_MINUTE, second=0, microsecond=0)
     yesterday = (now - timedelta(days=1)).date()
+
+    if yesterday.weekday() in SKIP_WEEKDAYS:
+        return
+
+    window_end = now.replace(hour=CHECK_HOUR, minute=CHECK_MINUTE, second=0, microsecond=0)
     window_start = datetime.combine(yesterday, time(15, 0), tzinfo=KST)
 
     chat_ids = db_execute(
@@ -230,10 +247,55 @@ async def check_and_mention(context: ContextTypes.DEFAULT_TYPE) -> None:
         if not missing:
             continue
 
-        await _send_mentions(context, chat_id, missing)
+        await _send_mentions(context, chat_id, missing, MENTION_MESSAGE)
 
 
-async def _send_mentions(context, chat_id, missing_users) -> None:
+async def midnight_reminder(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    월/수/금에서 다음날로 넘어가는 자정(00:00)에,
+    그날 15시부터 지금(자정)까지 아직 이미지를 안 올린 참가자에게
+    미리 리마인드 메시지를 보낸다. (최종 점검은 아침 7시에 별도로 나감)
+    """
+    now = datetime.now(KST)
+    # run_daily가 00:00에 실행되므로, 방금 끝난 미션 날짜는 하루 전으로 계산
+    mission_day = (now - timedelta(seconds=1)).date()
+
+    if mission_day.weekday() not in REMINDER_WEEKDAYS:
+        return
+
+    window_start = datetime.combine(mission_day, time(15, 0), tzinfo=KST)
+    window_end = now
+
+    chat_ids = db_execute(
+        "SELECT DISTINCT chat_id FROM participants WHERE active=1", fetch=True
+    )
+
+    for (chat_id,) in chat_ids:
+        participants = db_execute(
+            "SELECT user_id, username, full_name FROM participants WHERE chat_id=? AND active=1",
+            (chat_id,),
+            fetch=True,
+        )
+        uploaded_ids = {
+            row[0]
+            for row in db_execute(
+                """
+                SELECT DISTINCT user_id FROM uploads
+                WHERE chat_id=? AND uploaded_at >= ? AND uploaded_at < ?
+                """,
+                (chat_id, window_start.isoformat(), window_end.isoformat()),
+                fetch=True,
+            )
+        }
+
+        missing = [p for p in participants if p[0] not in uploaded_ids]
+        if not missing:
+            continue
+
+        await _send_mentions(context, chat_id, missing, REMINDER_MESSAGE)
+
+
+async def _send_mentions(context, chat_id, missing_users, message: str) -> None:
     mentions = []
     for user_id, username, full_name in missing_users:
         name = escape(full_name or (f"@{username}" if username else str(user_id)))
@@ -252,17 +314,26 @@ async def _send_mentions(context, chat_id, missing_users) -> None:
         chunks.append(chunk)
 
     for c in chunks:
-        text = ", ".join(c) + "\n" + MENTION_MESSAGE
+        text = ", ".join(c) + "\n" + message
         await context.bot.send_message(chat_id, text, parse_mode=ParseMode.HTML)
 
 
 async def manual_check(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """/현황 - 관리자가 즉시 테스트로 실행해볼 수 있는 명령어"""
+    """/현황 - 관리자가 즉시 테스트로 실행해볼 수 있는 명령어 (아침 최종 점검)"""
     if not await _is_admin(update, context):
         await update.message.reply_text("관리자만 사용할 수 있는 명령어예요.")
         return
     await check_and_mention(context)
     await update.message.reply_text("점검을 완료했습니다.")
+
+
+async def manual_reminder(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/리마인드 - 관리자가 자정 리마인드를 즉시 테스트로 실행해볼 수 있는 명령어"""
+    if not await _is_admin(update, context):
+        await update.message.reply_text("관리자만 사용할 수 있는 명령어예요.")
+        return
+    await midnight_reminder(context)
+    await update.message.reply_text("리마인드를 완료했습니다.")
 
 
 # ─────────────────────────────────────────────
@@ -290,12 +361,21 @@ def main() -> None:
     app.add_handler(CommandHandler("check", manual_check))
     app.add_handler(MessageHandler(filters.Regex(r"^/?현황$"), manual_check))
 
+    app.add_handler(CommandHandler("remind_check", manual_reminder))
+    app.add_handler(MessageHandler(filters.Regex(r"^/?리마인드$"), manual_reminder))
+
     app.add_handler(MessageHandler(filters.PHOTO, on_photo))
 
-    # 매일 09:00(KST)에 자동 실행
+    # 매일 07:00(KST) 최종 점검 + 멘션
     app.job_queue.run_daily(
         check_and_mention,
         time=time(CHECK_HOUR, CHECK_MINUTE, tzinfo=KST),
+    )
+
+    # 매일 00:00(KST) 자정 리마인드 (월/수/금 다음날 자정에만 실제로 발송됨)
+    app.job_queue.run_daily(
+        midnight_reminder,
+        time=time(REMINDER_HOUR, REMINDER_MINUTE, tzinfo=KST),
     )
 
     logger.info("봇을 시작합니다...")
