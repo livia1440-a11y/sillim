@@ -195,14 +195,14 @@ async def on_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 # ─────────────────────────────────────────────
 async def check_and_mention(context: ContextTypes.DEFAULT_TYPE) -> None:
     """
-    '전날부터 오전 9시까지' = 어제 00:00 ~ 오늘 09:00 사이에
-    사진을 한 장도 올리지 않은 활성 참가자를 멘션한다.
-    (원하는 기준이 '어제 09:00 ~ 오늘 09:00' 라면 window_start 계산만 바꾸면 됨)
+    '전날 오후 3시 ~ 오늘 오전 7시' 사이에
+    사진(이미지)을 한 장도 올리지 않은 활성 참가자를 멘션한다.
+    동영상은 인정하지 않음 (photo 핸들러만 업로드로 기록하므로 자동으로 제외됨)
     """
     now = datetime.now(KST)
     window_end = now.replace(hour=CHECK_HOUR, minute=CHECK_MINUTE, second=0, microsecond=0)
     yesterday = (now - timedelta(days=1)).date()
-    window_start = datetime.combine(yesterday, time(0, 0), tzinfo=KST)
+    window_start = datetime.combine(yesterday, time(15, 0), tzinfo=KST)
 
     chat_ids = db_execute(
         "SELECT DISTINCT chat_id FROM participants WHERE active=1", fetch=True
