@@ -39,7 +39,10 @@ KST = ZoneInfo("Asia/Seoul")
 DB_PATH = "photo_bot.db"
 
 # 매일 몇 시에 점검 메시지를 보낼지
-CHECK_HOUR, CHECK_MINUTE = 9, 0
+CHECK_HOUR, CHECK_MINUTE = 7, 0
+
+# 미업로드자 멘션 뒤에 붙일 멘트 (필요하면 이 문구만 수정하면 됩니다)
+MENTION_MESSAGE = "전도사님! 분반 자가피드백 올려주셔야 합니다!♡"
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -126,6 +129,27 @@ async def unregister(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     await update.message.reply_text(f"{user.full_name}님을 명단에서 제외했습니다.")
 
 
+async def admin_remove(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """관리자가 다른 사람을 대신 명단에서 제외 (그 사람 메시지에 답장하며 '삭제' 입력)"""
+    if not await _is_admin(update, context):
+        await update.message.reply_text("관리자만 사용할 수 있는 명령어예요.")
+        return
+
+    if not update.message.reply_to_message:
+        await update.message.reply_text(
+            "명단에서 뺄 사람의 메시지에 답장(reply)하면서 '삭제'라고 입력해주세요."
+        )
+        return
+
+    target = update.message.reply_to_message.from_user
+    chat = update.effective_chat
+    db_execute(
+        "UPDATE participants SET active=0 WHERE chat_id=? AND user_id=?",
+        (chat.id, target.id),
+    )
+    await update.message.reply_text(f"{target.full_name}님을 명단에서 제외했습니다.")
+
+
 async def list_participants(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """/참가자목록 - 관리자만 실행 가능"""
     if not await _is_admin(update, context):
@@ -206,13 +230,10 @@ async def check_and_mention(context: ContextTypes.DEFAULT_TYPE) -> None:
         if not missing:
             continue
 
-        await _send_mentions(context, chat_id, missing, window_start, window_end)
+        await _send_mentions(context, chat_id, missing)
 
 
-async def _send_mentions(context, chat_id, missing_users, window_start, window_end) -> None:
-    header = (
-        f"📸 {window_start.strftime('%m/%d')} ~ {window_end.strftime('%m/%d %H:%M')} 사진 미업로드 참가자\n"
-    )
+async def _send_mentions(context, chat_id, missing_users) -> None:
     mentions = []
     for user_id, username, full_name in missing_users:
         name = escape(full_name or (f"@{username}" if username else str(user_id)))
@@ -220,18 +241,18 @@ async def _send_mentions(context, chat_id, missing_users, window_start, window_e
         mentions.append(f'<a href="tg://user?id={user_id}">{name}</a>')
 
     # 텔레그램 메시지 길이 제한(4096자) 대응: 넘치면 나눠 보냄
-    chunk, chunks, length = [], [], len(header)
+    chunk, chunks, length = [], [], 0
     for m in mentions:
         if length + len(m) + 2 > 3800:
             chunks.append(chunk)
-            chunk, length = [], len(header)
+            chunk, length = [], 0
         chunk.append(m)
         length += len(m) + 2
     if chunk:
         chunks.append(chunk)
 
-    for i, c in enumerate(chunks):
-        text = header + ", ".join(c) if i == 0 else ", ".join(c)
+    for c in chunks:
+        text = ", ".join(c) + "\n" + MENTION_MESSAGE
         await context.bot.send_message(chat_id, text, parse_mode=ParseMode.HTML)
 
 
@@ -262,6 +283,9 @@ def main() -> None:
 
     app.add_handler(CommandHandler("list", list_participants))
     app.add_handler(MessageHandler(filters.Regex(r"^/?참가자목록$"), list_participants))
+
+    app.add_handler(CommandHandler("remove", admin_remove))
+    app.add_handler(MessageHandler(filters.Regex(r"^/?삭제$"), admin_remove))
 
     app.add_handler(CommandHandler("check", manual_check))
     app.add_handler(MessageHandler(filters.Regex(r"^/?현황$"), manual_check))
