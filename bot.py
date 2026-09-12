@@ -252,10 +252,20 @@ def main() -> None:
 
     app: Application = ApplicationBuilder().token(BOT_TOKEN).build()
 
-    app.add_handler(CommandHandler(["등록", "register"], register))
-    app.add_handler(CommandHandler(["탈퇴", "unregister"], unregister))
-    app.add_handler(CommandHandler(["참가자목록", "list"], list_participants))
-    app.add_handler(CommandHandler(["현황", "check"], manual_check))
+    # 텔레그램 명령어(/command)는 영어/숫자만 허용되므로 영어 명령어를 기본으로 두고,
+    # 참가자들이 실제로 편하게 쓸 수 있도록 슬래시 없는 한글 단어도 함께 인식하게 처리
+    app.add_handler(CommandHandler("register", register))
+    app.add_handler(MessageHandler(filters.Regex(r"^/?등록$"), register))
+
+    app.add_handler(CommandHandler("unregister", unregister))
+    app.add_handler(MessageHandler(filters.Regex(r"^/?탈퇴$"), unregister))
+
+    app.add_handler(CommandHandler("list", list_participants))
+    app.add_handler(MessageHandler(filters.Regex(r"^/?참가자목록$"), list_participants))
+
+    app.add_handler(CommandHandler("check", manual_check))
+    app.add_handler(MessageHandler(filters.Regex(r"^/?현황$"), manual_check))
+
     app.add_handler(MessageHandler(filters.PHOTO, on_photo))
 
     # 매일 09:00(KST)에 자동 실행
