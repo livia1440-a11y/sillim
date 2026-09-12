@@ -201,6 +201,41 @@ async def on_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 # ─────────────────────────────────────────────
 # 4. 매일 오전 9시 점검 + 멘션
 # ─────────────────────────────────────────────
+async def _run_missing_check(context: ContextTypes.DEFAULT_TYPE, window_start, window_end, message: str) -> bool:
+    """지정된 구간에 이미지를 안 올린 참가자를 찾아 멘션. 하나라도 보냈으면 True 반환."""
+    chat_ids = db_execute(
+        "SELECT DISTINCT chat_id FROM participants WHERE active=1", fetch=True
+    )
+
+    sent_any = False
+    for (chat_id,) in chat_ids:
+        participants = db_execute(
+            "SELECT user_id, username, full_name FROM participants WHERE chat_id=? AND active=1",
+            (chat_id,),
+            fetch=True,
+        )
+        uploaded_ids = {
+            row[0]
+            for row in db_execute(
+                """
+                SELECT DISTINCT user_id FROM uploads
+                WHERE chat_id=? AND uploaded_at >= ? AND uploaded_at < ?
+                """,
+                (chat_id, window_start.isoformat(), window_end.isoformat()),
+                fetch=True,
+            )
+        }
+
+        missing = [p for p in participants if p[0] not in uploaded_ids]
+        if not missing:
+            continue
+
+        await _send_mentions(context, chat_id, missing, message)
+        sent_any = True
+
+    return sent_any
+
+
 async def check_and_mention(context: ContextTypes.DEFAULT_TYPE) -> None:
     """
     미션 요일: 월/수/금/일 (취침 전까지 이미지 업로드)
@@ -221,33 +256,7 @@ async def check_and_mention(context: ContextTypes.DEFAULT_TYPE) -> None:
     window_end = now.replace(hour=CHECK_HOUR, minute=CHECK_MINUTE, second=0, microsecond=0)
     window_start = datetime.combine(yesterday, time(15, 0), tzinfo=KST)
 
-    chat_ids = db_execute(
-        "SELECT DISTINCT chat_id FROM participants WHERE active=1", fetch=True
-    )
-
-    for (chat_id,) in chat_ids:
-        participants = db_execute(
-            "SELECT user_id, username, full_name FROM participants WHERE chat_id=? AND active=1",
-            (chat_id,),
-            fetch=True,
-        )
-        uploaded_ids = {
-            row[0]
-            for row in db_execute(
-                """
-                SELECT DISTINCT user_id FROM uploads
-                WHERE chat_id=? AND uploaded_at >= ? AND uploaded_at < ?
-                """,
-                (chat_id, window_start.isoformat(), window_end.isoformat()),
-                fetch=True,
-            )
-        }
-
-        missing = [p for p in participants if p[0] not in uploaded_ids]
-        if not missing:
-            continue
-
-        await _send_mentions(context, chat_id, missing, MENTION_MESSAGE)
+    await _run_missing_check(context, window_start, window_end, MENTION_MESSAGE)
 
 
 async def midnight_reminder(context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -266,33 +275,7 @@ async def midnight_reminder(context: ContextTypes.DEFAULT_TYPE) -> None:
     window_start = datetime.combine(mission_day, time(15, 0), tzinfo=KST)
     window_end = now
 
-    chat_ids = db_execute(
-        "SELECT DISTINCT chat_id FROM participants WHERE active=1", fetch=True
-    )
-
-    for (chat_id,) in chat_ids:
-        participants = db_execute(
-            "SELECT user_id, username, full_name FROM participants WHERE chat_id=? AND active=1",
-            (chat_id,),
-            fetch=True,
-        )
-        uploaded_ids = {
-            row[0]
-            for row in db_execute(
-                """
-                SELECT DISTINCT user_id FROM uploads
-                WHERE chat_id=? AND uploaded_at >= ? AND uploaded_at < ?
-                """,
-                (chat_id, window_start.isoformat(), window_end.isoformat()),
-                fetch=True,
-            )
-        }
-
-        missing = [p for p in participants if p[0] not in uploaded_ids]
-        if not missing:
-            continue
-
-        await _send_mentions(context, chat_id, missing, REMINDER_MESSAGE)
+    await _run_missing_check(context, window_start, window_end, REMINDER_MESSAGE)
 
 
 async def _send_mentions(context, chat_id, missing_users, message: str) -> None:
@@ -318,22 +301,45 @@ async def _send_mentions(context, chat_id, missing_users, message: str) -> None:
         await context.bot.send_message(chat_id, text, parse_mode=ParseMode.HTML)
 
 
+_WEEKDAY_NAMES = ["월", "화", "수", "목", "금", "토", "일"]
+
+
 async def manual_check(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """/현황 - 관리자가 즉시 테스트로 실행해볼 수 있는 명령어 (아침 최종 점검)"""
+    """/현황 - 관리자가 즉시 테스트로 실행해볼 수 있는 명령어 (아침 최종 점검, 요일 무시하고 강제 실행)"""
     if not await _is_admin(update, context):
         await update.message.reply_text("관리자만 사용할 수 있는 명령어예요.")
         return
-    await check_and_mention(context)
-    await update.message.reply_text("점검을 완료했습니다.")
+
+    now = datetime.now(KST)
+    yesterday = (now - timedelta(days=1)).date()
+    window_end = now
+    window_start = datetime.combine(yesterday, time(15, 0), tzinfo=KST)
+
+    is_off_day = yesterday.weekday() in SKIP_WEEKDAYS
+    sent = await _run_missing_check(context, window_start, window_end, MENTION_MESSAGE)
+
+    note = f" (참고: 어제({_WEEKDAY_NAMES[yesterday.weekday()]})는 원래 미션이 없는 날이라 실제 자동 점검은 건너뜁니다. 지금은 테스트라 강제로 실행했어요.)" if is_off_day else ""
+    result = "미업로드자가 있어 메시지를 보냈습니다." if sent else "미업로드자가 없습니다."
+    await update.message.reply_text(f"점검을 완료했습니다. {result}{note}")
 
 
 async def manual_reminder(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """/리마인드 - 관리자가 자정 리마인드를 즉시 테스트로 실행해볼 수 있는 명령어"""
+    """/리마인드 - 관리자가 자정 리마인드를 즉시 테스트로 실행해볼 수 있는 명령어 (요일 무시하고 강제 실행)"""
     if not await _is_admin(update, context):
         await update.message.reply_text("관리자만 사용할 수 있는 명령어예요.")
         return
-    await midnight_reminder(context)
-    await update.message.reply_text("리마인드를 완료했습니다.")
+
+    now = datetime.now(KST)
+    mission_day = now.date()
+    window_start = datetime.combine(mission_day, time(15, 0), tzinfo=KST)
+    window_end = now
+
+    is_off_day = mission_day.weekday() not in REMINDER_WEEKDAYS
+    sent = await _run_missing_check(context, window_start, window_end, REMINDER_MESSAGE)
+
+    note = f" (참고: 오늘({_WEEKDAY_NAMES[mission_day.weekday()]})은 원래 리마인드가 없는 날이라 실제 자동 발송은 건너뜁니다. 지금은 테스트라 강제로 실행했어요.)" if is_off_day else ""
+    result = "미업로드자가 있어 메시지를 보냈습니다." if sent else "미업로드자가 없습니다."
+    await update.message.reply_text(f"리마인드를 완료했습니다. {result}{note}")
 
 
 # ─────────────────────────────────────────────
