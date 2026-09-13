@@ -36,7 +36,9 @@ load_dotenv()  # .env 파일에서 BOT_TOKEN을 읽어옴
 
 BOT_TOKEN = os.environ["BOT_TOKEN"]          # .env 에 BOT_TOKEN=123456:ABC... 형태로 저장
 KST = ZoneInfo("Asia/Seoul")
-DB_PATH = "photo_bot.db"
+# DB_PATH 환경변수가 있으면 그 경로를 쓰고, 없으면 현재 폴더에 저장
+# (Railway에서는 Volume을 마운트한 경로로 DB_PATH를 지정해야 재배포해도 데이터가 유지됨)
+DB_PATH = os.environ.get("DB_PATH", "photo_bot.db")
 
 # 매일 몇 시에 점검 메시지를 보낼지
 CHECK_HOUR, CHECK_MINUTE = 7, 0
@@ -63,6 +65,10 @@ logger = logging.getLogger(__name__)
 # 1. 데이터베이스 (SQLite)
 # ─────────────────────────────────────────────
 def init_db() -> None:
+    db_dir = os.path.dirname(DB_PATH)
+    if db_dir:
+        os.makedirs(db_dir, exist_ok=True)
+
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
     cur.execute(
