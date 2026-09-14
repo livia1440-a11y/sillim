@@ -69,6 +69,7 @@ logging.basicConfig(
     level=logging.INFO,
 )
 logger = logging.getLogger(__name__)
+logger.info("허용된 chat_id 목록(ALLOWED_CHAT_IDS): %s", ALLOWED_CHAT_IDS)
 
 
 # 허용된 그룹에서만 동작하게 만드는 필터 (ALLOWED_CHAT_IDS 미설정 시 전체 허용 = 기존 동작 유지)
