@@ -13,6 +13,7 @@ import logging
 import sqlite3
 from datetime import datetime, time, timedelta
 from html import escape
+from time import monotonic
 from zoneinfo import ZoneInfo
 
 from dotenv import load_dotenv
@@ -23,6 +24,7 @@ from telegram.constants import ParseMode, ChatMemberStatus
 from telegram.ext import (
     Application,
     ApplicationBuilder,
+    ChatMemberHandler,
     CommandHandler,
     ContextTypes,
     MessageHandler,
@@ -46,19 +48,75 @@ CHECK_HOUR, CHECK_MINUTE = 7, 0
 # 미션이 없는 요일 (Python weekday: 월=0, 화=1, 수=2, 목=3, 금=4, 토=5, 일=6)
 SKIP_WEEKDAYS = {1, 3, 5}  # 화, 목, 토 — 이 요일 몫은 점검하지 않음
 
-# 미업로드자 멘션 뒤에 붙일 멘트 (필요하면 이 문구만 수정하면 됩니다)
-MENTION_MESSAGE = "전도사님! 분반 자가피드백 올려주셔야 합니다!♡"
+# 미업로드자 멘션 뒤에 붙일 멘트 (Railway Variables의 MENTION_MESSAGE로 실제 문구를 설정하세요.
+#  코드에는 조직 특유의 표현을 남기지 않기 위해 중립적인 기본값만 둡니다.)
+MENTION_MESSAGE = os.environ.get("MENTION_MESSAGE", "아직 사진을 안 올리신 분들이에요, 확인 부탁드려요!")
 
 # 자정 리마인드: 몇 시에 보낼지 / 어떤 문구를 보낼지 / 어떤 요일 다음날 자정에 보낼지
 REMINDER_HOUR, REMINDER_MINUTE = 0, 0
-REMINDER_MESSAGE = "전도사님들! 분반 자가 피드백 올려주세요❤️🙏🏻"
+REMINDER_MESSAGE = os.environ.get("REMINDER_MESSAGE", "취침 전까지 사진 업로드 잊지 마세요!")
 REMINDER_WEEKDAYS = {0, 2, 4}  # 월, 수, 금 — 이 요일에서 다음날로 넘어가는 자정에 리마인드
+
+# 이 봇이 동작할 그룹만 허용 (쉼표로 구분된 chat_id 목록). 비워두면 모든 그룹에서 동작(기존과 동일).
+_allowed_raw = os.environ.get("ALLOWED_CHAT_IDS", "").strip()
+ALLOWED_CHAT_IDS = {int(x) for x in _allowed_raw.split(",") if x.strip()} if _allowed_raw else None
+
+# 사용자별 명령 연타 방지 (초 단위 최소 간격)
+COMMAND_COOLDOWN_SECONDS = 2
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=logging.INFO,
 )
 logger = logging.getLogger(__name__)
+
+
+# 허용된 그룹에서만 동작하게 만드는 필터 (ALLOWED_CHAT_IDS 미설정 시 전체 허용 = 기존 동작 유지)
+class _AllowedChatFilter(filters.MessageFilter):
+    def filter(self, message):
+        if ALLOWED_CHAT_IDS is None:
+            return True
+        return message.chat_id in ALLOWED_CHAT_IDS
+
+
+allowed_chat_filter = _AllowedChatFilter()
+
+# 사용자별 명령 연타 방지용 최근 호출 시각 기록
+_last_command_ts: dict[int, float] = {}
+
+
+def _rate_limited(user_id: int) -> bool:
+    """너무 짧은 간격으로 같은 사용자가 다시 요청하면 True(막음)를 반환."""
+    now = monotonic()
+    last = _last_command_ts.get(user_id, 0.0)
+    if now - last < COMMAND_COOLDOWN_SECONDS:
+        return True
+    _last_command_ts[user_id] = now
+    return False
+
+
+async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """예외를 서버 로그에만 남기고, 사용자에게는 세부 내용을 노출하지 않음."""
+    logger.error("처리 중 오류 발생", exc_info=context.error)
+
+
+async def on_bot_added(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """허용되지 않은 그룹에 봇이 추가되면 자동으로 나감 (ALLOWED_CHAT_IDS 설정 시에만 동작)."""
+    if ALLOWED_CHAT_IDS is None:
+        return
+
+    my_chat_member = update.my_chat_member
+    if not my_chat_member:
+        return
+
+    new_status = my_chat_member.new_chat_member.status
+    chat = update.effective_chat
+    if new_status in (ChatMemberStatus.MEMBER, ChatMemberStatus.ADMINISTRATOR) and chat.id not in ALLOWED_CHAT_IDS:
+        try:
+            await context.bot.leave_chat(chat.id)
+            logger.info("허용되지 않은 그룹(%s)이라 자동으로 나갔습니다.", chat.id)
+        except Exception:
+            logger.exception("허용되지 않은 그룹에서 나가기 실패")
 
 
 # ─────────────────────────────────────────────
@@ -114,6 +172,9 @@ async def register(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
     chat = update.effective_chat
 
+    if _rate_limited(user.id):
+        return
+
     if chat.type not in ("group", "supergroup"):
         await update.message.reply_text("이 명령어는 단체 채팅방에서만 사용할 수 있어요.")
         return
@@ -136,6 +197,10 @@ async def unregister(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     """/탈퇴 - 본인을 명단에서 제외"""
     user = update.effective_user
     chat = update.effective_chat
+
+    if _rate_limited(user.id):
+        return
+
     db_execute(
         "UPDATE participants SET active=0 WHERE chat_id=? AND user_id=?",
         (chat.id, user.id),
@@ -145,6 +210,9 @@ async def unregister(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
 async def admin_remove(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """관리자가 다른 사람을 대신 명단에서 제외 (그 사람 메시지에 답장하며 '삭제' 입력)"""
+    if _rate_limited(update.effective_user.id):
+        return
+
     if not await _is_admin(update, context):
         await update.message.reply_text("관리자만 사용할 수 있는 명령어예요.")
         return
@@ -164,8 +232,21 @@ async def admin_remove(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     await update.message.reply_text(f"{target.full_name}님을 명단에서 제외했습니다.")
 
 
+async def show_chat_id(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/chatid, 채팅ID - 이 그룹의 chat_id를 알려줌 (ALLOWED_CHAT_IDS 설정용, 관리자 전용 아님 — 그룹 확인용이라 누구나 가능)"""
+    chat = update.effective_chat
+    await update.message.reply_text(
+        f"이 그룹의 chat_id는 다음과 같습니다:\n`{chat.id}`\n\n"
+        "이 값을 Railway의 ALLOWED_CHAT_IDS 환경변수에 넣으면 이 그룹에서만 봇이 동작하게 됩니다.",
+        parse_mode=ParseMode.MARKDOWN,
+    )
+
+
 async def list_participants(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """/참가자목록 - 관리자만 실행 가능"""
+    if _rate_limited(update.effective_user.id):
+        return
+
     if not await _is_admin(update, context):
         await update.message.reply_text("관리자만 사용할 수 있는 명령어예요.")
         return
@@ -180,7 +261,15 @@ async def list_participants(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         return
 
     text = "\n".join(f"• {name} (@{uname})" if uname else f"• {name}" for name, uname in rows)
-    await update.message.reply_text(f"현재 등록된 참가자 ({len(rows)}명)\n{text}")
+    admin_id = update.effective_user.id
+    try:
+        # 참가자 명단(개인정보)은 그룹에 공개하지 않고 관리자 개인 DM으로만 전송
+        await context.bot.send_message(admin_id, f"현재 등록된 참가자 ({len(rows)}명)\n{text}")
+        await update.message.reply_text("명단을 DM으로 보내드렸어요.")
+    except Exception:
+        await update.message.reply_text(
+            "DM 전송에 실패했어요. 먼저 봇과 1:1 대화를 한 번 시작(DM에서 아무 메시지나 전송)한 뒤 다시 시도해주세요."
+        )
 
 
 async def _is_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
@@ -312,6 +401,9 @@ _WEEKDAY_NAMES = ["월", "화", "수", "목", "금", "토", "일"]
 
 async def manual_check(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """/현황 - 관리자가 즉시 테스트로 실행해볼 수 있는 명령어 (아침 최종 점검, 요일 무시하고 강제 실행)"""
+    if _rate_limited(update.effective_user.id):
+        return
+
     if not await _is_admin(update, context):
         await update.message.reply_text("관리자만 사용할 수 있는 명령어예요.")
         return
@@ -331,6 +423,9 @@ async def manual_check(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 async def manual_reminder(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """/리마인드 - 관리자가 자정 리마인드를 즉시 테스트로 실행해볼 수 있는 명령어 (요일 무시하고 강제 실행)"""
+    if _rate_limited(update.effective_user.id):
+        return
+
     if not await _is_admin(update, context):
         await update.message.reply_text("관리자만 사용할 수 있는 명령어예요.")
         return
@@ -358,25 +453,36 @@ def main() -> None:
 
     # 텔레그램 명령어(/command)는 영어/숫자만 허용되므로 영어 명령어를 기본으로 두고,
     # 참가자들이 실제로 편하게 쓸 수 있도록 슬래시 없는 한글 단어도 함께 인식하게 처리
-    app.add_handler(CommandHandler("register", register))
-    app.add_handler(MessageHandler(filters.Regex(r"^/?등록$"), register))
+    # (ALLOWED_CHAT_IDS가 설정되어 있으면 그 그룹들에서만 반응)
+    app.add_handler(CommandHandler("register", register, filters=allowed_chat_filter))
+    app.add_handler(MessageHandler(filters.Regex(r"^/?등록$") & allowed_chat_filter, register))
 
-    app.add_handler(CommandHandler("unregister", unregister))
-    app.add_handler(MessageHandler(filters.Regex(r"^/?탈퇴$"), unregister))
+    app.add_handler(CommandHandler("unregister", unregister, filters=allowed_chat_filter))
+    app.add_handler(MessageHandler(filters.Regex(r"^/?탈퇴$") & allowed_chat_filter, unregister))
 
-    app.add_handler(CommandHandler("list", list_participants))
-    app.add_handler(MessageHandler(filters.Regex(r"^/?참가자목록$"), list_participants))
+    app.add_handler(CommandHandler("list", list_participants, filters=allowed_chat_filter))
+    app.add_handler(MessageHandler(filters.Regex(r"^/?참가자목록$") & allowed_chat_filter, list_participants))
 
-    app.add_handler(CommandHandler("remove", admin_remove))
-    app.add_handler(MessageHandler(filters.Regex(r"^/?삭제$"), admin_remove))
+    app.add_handler(CommandHandler("remove", admin_remove, filters=allowed_chat_filter))
+    app.add_handler(MessageHandler(filters.Regex(r"^/?삭제$") & allowed_chat_filter, admin_remove))
 
-    app.add_handler(CommandHandler("check", manual_check))
-    app.add_handler(MessageHandler(filters.Regex(r"^/?현황$"), manual_check))
+    app.add_handler(CommandHandler("check", manual_check, filters=allowed_chat_filter))
+    app.add_handler(MessageHandler(filters.Regex(r"^/?현황$") & allowed_chat_filter, manual_check))
 
-    app.add_handler(CommandHandler("remind_check", manual_reminder))
-    app.add_handler(MessageHandler(filters.Regex(r"^/?리마인드$"), manual_reminder))
+    app.add_handler(CommandHandler("remind_check", manual_reminder, filters=allowed_chat_filter))
+    app.add_handler(MessageHandler(filters.Regex(r"^/?리마인드$") & allowed_chat_filter, manual_reminder))
 
-    app.add_handler(MessageHandler(filters.PHOTO, on_photo))
+    app.add_handler(MessageHandler(filters.PHOTO & allowed_chat_filter, on_photo))
+
+    # chat_id 확인용 (ALLOWED_CHAT_IDS 설정 전/후 모두 사용 가능하도록 허용 필터 없이 등록)
+    app.add_handler(CommandHandler("chatid", show_chat_id))
+    app.add_handler(MessageHandler(filters.Regex(r"^/?채팅ID$"), show_chat_id))
+
+    # 허용되지 않은 그룹에 추가되면 자동으로 나감 (ALLOWED_CHAT_IDS 설정 시에만 동작)
+    app.add_handler(ChatMemberHandler(on_bot_added, ChatMemberHandler.MY_CHAT_MEMBER))
+
+    # 예외는 서버 로그에만 남기고 사용자에게 세부 내용을 노출하지 않음
+    app.add_error_handler(on_error)
 
     # 매일 07:00(KST) 최종 점검 + 멘션
     app.job_queue.run_daily(
