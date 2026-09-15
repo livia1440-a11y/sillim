@@ -19,7 +19,7 @@ from zoneinfo import ZoneInfo
 from dotenv import load_dotenv
 import os
 
-from telegram import Update
+from telegram import ReactionTypeEmoji, Update
 from telegram.constants import ParseMode, ChatMemberStatus
 from telegram.ext import (
     Application,
@@ -292,6 +292,18 @@ async def _is_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
 # ─────────────────────────────────────────────
 # 3. 사진 업로드 감지 / 사유 텍스트 감지
 # ─────────────────────────────────────────────
+async def _react_thumbs_up(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """보고로 인정된 메시지에 👍 반응을 남김. 실패해도 전체 흐름에는 영향 없게 처리."""
+    try:
+        await context.bot.set_message_reaction(
+            chat_id=update.effective_chat.id,
+            message_id=update.effective_message.message_id,
+            reaction=[ReactionTypeEmoji(emoji="👍")],
+        )
+    except Exception:
+        logger.exception("메시지 반응(리액션) 남기기 실패")
+
+
 async def on_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
     chat = update.effective_chat
@@ -301,6 +313,7 @@ async def on_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "INSERT INTO uploads (chat_id, user_id, uploaded_at, type) VALUES (?, ?, ?, 'photo')",
         (chat.id, user.id, now.isoformat()),
     )
+    await _react_thumbs_up(update, context)
 
 
 async def on_text_note(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -316,6 +329,7 @@ async def on_text_note(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "INSERT INTO uploads (chat_id, user_id, uploaded_at, type) VALUES (?, ?, ?, 'note')",
         (chat.id, user.id, now.isoformat()),
     )
+    await _react_thumbs_up(update, context)
 
 
 # ─────────────────────────────────────────────
