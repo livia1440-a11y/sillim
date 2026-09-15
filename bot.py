@@ -50,12 +50,15 @@ SKIP_WEEKDAYS = {1, 3, 5}  # 화, 목, 토 — 이 요일 몫은 점검하지 �
 
 # 미업로드자 멘션 뒤에 붙일 멘트 (Railway Variables의 MENTION_MESSAGE로 실제 문구를 설정하세요.
 #  코드에는 조직 특유의 표현을 남기지 않기 위해 중립적인 기본값만 둡니다.)
-MENTION_MESSAGE = os.environ.get("MENTION_MESSAGE", "아직 사진을 안 올리신 분들이에요, 확인 부탁드려요!")
+MENTION_MESSAGE = os.environ.get("MENTION_MESSAGE", "아직 자가피드백을 안하셨어요. 어서 완료해주세요🔥")
 
 # 자정 리마인드: 몇 시에 보낼지 / 어떤 문구를 보낼지 / 어떤 요일 다음날 자정에 보낼지
 REMINDER_HOUR, REMINDER_MINUTE = 0, 0
-REMINDER_MESSAGE = os.environ.get("REMINDER_MESSAGE", "취침 전까지 사진 업로드 잊지 마세요!")
+REMINDER_MESSAGE = os.environ.get("REMINDER_MESSAGE", '취침 전까지 "자가피드백" 잊지 마세요❤️')
 REMINDER_WEEKDAYS = {0, 2, 4}  # 월, 수, 금 — 이 요일에서 다음날로 넘어가는 자정에 리마인드
+
+# 매주 월요일 07:00 "보고누락왕" 순위에서, 3등 점수와 동점자가 이 숫자보다 많으면 3등은 발표하지 않음
+WEEKLY_RANK_TIE_LIMIT = 5
 
 # 이 봇이 동작할 그룹만 허용 (쉼표로 구분된 chat_id 목록). 비워두면 모든 그룹에서 동작(기존과 동일).
 _allowed_raw = os.environ.get("ALLOWED_CHAT_IDS", "").strip()
@@ -147,10 +150,16 @@ def init_db() -> None:
         CREATE TABLE IF NOT EXISTS uploads (
             chat_id     INTEGER NOT NULL,
             user_id     INTEGER NOT NULL,
-            uploaded_at TEXT NOT NULL
+            uploaded_at TEXT NOT NULL,
+            type        TEXT NOT NULL DEFAULT 'photo'
         )
         """
     )
+    # 기존에 만들어져 있던 DB(볼륨에 저장된 이전 버전)에는 type 컬럼이 없을 수 있으므로 보정
+    try:
+        cur.execute("ALTER TABLE uploads ADD COLUMN type TEXT NOT NULL DEFAULT 'photo'")
+    except sqlite3.OperationalError:
+        pass  # 이미 컬럼이 있으면 무시
     conn.commit()
     conn.close()
 
@@ -281,7 +290,7 @@ async def _is_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
 
 
 # ─────────────────────────────────────────────
-# 3. 사진 업로드 감지
+# 3. 사진 업로드 감지 / 사유 텍스트 감지
 # ─────────────────────────────────────────────
 async def on_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
@@ -289,7 +298,22 @@ async def on_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     now = datetime.now(KST)
 
     db_execute(
-        "INSERT INTO uploads (chat_id, user_id, uploaded_at) VALUES (?, ?, ?)",
+        "INSERT INTO uploads (chat_id, user_id, uploaded_at, type) VALUES (?, ?, ?, 'photo')",
+        (chat.id, user.id, now.isoformat()),
+    )
+
+
+async def on_text_note(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    사진 대신 '사유'라는 단어가 포함된 텍스트를 남긴 경우 '보고 완료'로 인정.
+    (예: "사유: 오늘은 피드백할 내용이 없습니다")
+    """
+    user = update.effective_user
+    chat = update.effective_chat
+    now = datetime.now(KST)
+
+    db_execute(
+        "INSERT INTO uploads (chat_id, user_id, uploaded_at, type) VALUES (?, ?, ?, 'note')",
         (chat.id, user.id, now.isoformat()),
     )
 
@@ -374,6 +398,88 @@ async def midnight_reminder(context: ContextTypes.DEFAULT_TYPE) -> None:
     await _run_missing_check(context, window_start, window_end, REMINDER_MESSAGE)
 
 
+async def weekly_worst_report(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    매주 월요일 오전 7시, 지난 한 주(지난주 월/수/금/일)의 미션 누락 횟수를 집계해서
+    가장 많이 누락한 1~3등을 발표한다. 누락자가 아예 없으면 칭찬 메시지를 보낸다.
+    """
+    now = datetime.now(KST)
+    this_monday = now.date()
+    mission_dates = [
+        this_monday - timedelta(days=7),  # 지난주 월요일
+        this_monday - timedelta(days=5),  # 지난주 수요일
+        this_monday - timedelta(days=3),  # 지난주 금요일
+        this_monday - timedelta(days=1),  # 어제(일요일)
+    ]
+
+    chat_ids = db_execute(
+        "SELECT DISTINCT chat_id FROM participants WHERE active=1", fetch=True
+    )
+
+    for (chat_id,) in chat_ids:
+        participants = db_execute(
+            "SELECT user_id, username, full_name FROM participants WHERE chat_id=? AND active=1",
+            (chat_id,),
+            fetch=True,
+        )
+        name_map = {p[0]: p for p in participants}
+        miss_counts = {p[0]: 0 for p in participants}
+
+        for mission_date in mission_dates:
+            window_start = datetime.combine(mission_date, time(15, 0), tzinfo=KST)
+            window_end = datetime.combine(
+                mission_date + timedelta(days=1), time(CHECK_HOUR, CHECK_MINUTE), tzinfo=KST
+            )
+            uploaded_ids = {
+                row[0]
+                for row in db_execute(
+                    """
+                    SELECT DISTINCT user_id FROM uploads
+                    WHERE chat_id=? AND uploaded_at >= ? AND uploaded_at < ?
+                    """,
+                    (chat_id, window_start.isoformat(), window_end.isoformat()),
+                    fetch=True,
+                )
+            }
+            for uid in miss_counts:
+                if uid not in uploaded_ids:
+                    miss_counts[uid] += 1
+
+        missers = [(uid, cnt) for uid, cnt in miss_counts.items() if cnt > 0]
+
+        if not missers:
+            await context.bot.send_message(
+                chat_id,
+                "이번 주는 모두 자가피드백을 성실히 완료하셨어요! 정말 잘하셨습니다👏🎉",
+            )
+            continue
+
+        # 누락 횟수 내림차순, 동점이면 이름 가나다순으로 정렬해서 순위를 매김
+        missers.sort(key=lambda x: (-x[1], name_map[x[0]][2] or ""))
+
+        top = missers[:3]
+        if len(missers) >= 3:
+            third_count = missers[2][1]
+            tie_count = sum(1 for _, c in missers if c == third_count)
+            if tie_count > WEEKLY_RANK_TIE_LIMIT:
+                # 3등 동점자가 너무 많으면 3등은 통째로 제외하고 1,2등만 발표
+                top = [x for x in missers if x[1] != third_count][:2] or missers[:2]
+
+        lines = []
+        for rank, (uid, cnt) in enumerate(top, start=1):
+            _, username, full_name = name_map[uid]
+            name = escape(full_name or (f"@{username}" if username else str(uid)))
+            mention = f'<a href="tg://user?id={uid}">{name}</a>'
+            lines.append(f"{rank}. {mention}")
+
+        text = (
+            "보고누락왕 순위를 발표합니다..!🥲\n\n"
+            + "\n".join(lines)
+            + "\n\n이번주는 모두 분발 부탁드립니다💪🏻"
+        )
+        await context.bot.send_message(chat_id, text, parse_mode=ParseMode.HTML)
+
+
 async def _send_mentions(context, chat_id, missing_users, message: str) -> None:
     mentions = []
     for user_id, username, full_name in missing_users:
@@ -444,6 +550,19 @@ async def manual_reminder(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     await update.message.reply_text(f"리마인드를 완료했습니다. {result}{note}")
 
 
+async def manual_weekly(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/rank, 순위 - 관리자가 주간 누락왕 집계를 즉시 테스트로 실행해볼 수 있는 명령어"""
+    if _rate_limited(update.effective_user.id):
+        return
+
+    if not await _is_admin(update, context):
+        await update.message.reply_text("관리자만 사용할 수 있는 명령어예요.")
+        return
+
+    await weekly_worst_report(context)
+    await update.message.reply_text("주간 집계를 완료했습니다.")
+
+
 # ─────────────────────────────────────────────
 # 5. 앱 구성 및 실행
 # ─────────────────────────────────────────────
@@ -473,7 +592,19 @@ def main() -> None:
     app.add_handler(CommandHandler("remind_check", manual_reminder, filters=allowed_chat_filter))
     app.add_handler(MessageHandler(filters.Regex(r"^/?리마인드$") & allowed_chat_filter, manual_reminder))
 
+    app.add_handler(CommandHandler("rank", manual_weekly, filters=allowed_chat_filter))
+    app.add_handler(MessageHandler(filters.Regex(r"^/?순위$") & allowed_chat_filter, manual_weekly))
+
     app.add_handler(MessageHandler(filters.PHOTO & allowed_chat_filter, on_photo))
+
+    # 사진 대신 "사유"라는 단어가 포함된 텍스트를 남기면 보고 완료로 인정
+    # (참가자 안내 문구 예시: "사유: 오늘은 피드백할 내용이 없습니다")
+    app.add_handler(
+        MessageHandler(
+            filters.TEXT & filters.Regex(r"사유") & ~filters.COMMAND & allowed_chat_filter,
+            on_text_note,
+        )
+    )
 
     # chat_id 확인용 (ALLOWED_CHAT_IDS 설정 전/후 모두 사용 가능하도록 허용 필터 없이 등록)
     app.add_handler(CommandHandler("chatid", show_chat_id))
@@ -495,6 +626,13 @@ def main() -> None:
     app.job_queue.run_daily(
         midnight_reminder,
         time=time(REMINDER_HOUR, REMINDER_MINUTE, tzinfo=KST),
+    )
+
+    # 매주 월요일 07:00(KST) 주간 누락왕 발표
+    app.job_queue.run_daily(
+        weekly_worst_report,
+        time=time(CHECK_HOUR, CHECK_MINUTE, tzinfo=KST),
+        days=(0,),  # 0 = 월요일
     )
 
     logger.info("봇을 시작합니다...")
