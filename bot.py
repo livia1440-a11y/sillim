@@ -155,6 +155,15 @@ def init_db() -> None:
         )
         """
     )
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS holidays (
+            chat_id      INTEGER NOT NULL,
+            holiday_date TEXT NOT NULL,
+            PRIMARY KEY (chat_id, holiday_date)
+        )
+        """
+    )
     # 기존에 만들어져 있던 DB(볼륨에 저장된 이전 버전)에는 type 컬럼이 없을 수 있으므로 보정
     try:
         cur.execute("ALTER TABLE uploads ADD COLUMN type TEXT NOT NULL DEFAULT 'photo'")
@@ -289,6 +298,51 @@ async def _is_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
     return member.status in (ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.OWNER)
 
 
+def _is_holiday(chat_id: int, d) -> bool:
+    rows = db_execute(
+        "SELECT 1 FROM holidays WHERE chat_id=? AND holiday_date=?",
+        (chat_id, d.isoformat()),
+        fetch=True,
+    )
+    return bool(rows)
+
+
+async def mark_holiday(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/holiday, 휴무 - 오늘을 휴무로 등록. 오늘 몫에 대한 점검/리마인드/주간집계가 건너뛰어짐"""
+    if _rate_limited(update.effective_user.id):
+        return
+    if not await _is_admin(update, context):
+        await update.message.reply_text("관리자만 사용할 수 있는 명령어예요.")
+        return
+
+    chat = update.effective_chat
+    today = datetime.now(KST).date()
+    db_execute(
+        "INSERT OR IGNORE INTO holidays (chat_id, holiday_date) VALUES (?, ?)",
+        (chat.id, today.isoformat()),
+    )
+    await update.message.reply_text(
+        f"오늘({today.isoformat()})은 휴무로 등록했어요. 오늘 몫은 점검/리마인드/주간집계에서 제외됩니다."
+    )
+
+
+async def unmark_holiday(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/unholiday, 휴무해제 - 오늘의 휴무 등록을 취소"""
+    if _rate_limited(update.effective_user.id):
+        return
+    if not await _is_admin(update, context):
+        await update.message.reply_text("관리자만 사용할 수 있는 명령어예요.")
+        return
+
+    chat = update.effective_chat
+    today = datetime.now(KST).date()
+    db_execute(
+        "DELETE FROM holidays WHERE chat_id=? AND holiday_date=?",
+        (chat.id, today.isoformat()),
+    )
+    await update.message.reply_text("오늘의 휴무 등록을 해제했어요.")
+
+
 # ─────────────────────────────────────────────
 # 3. 사진 업로드 감지 / 사유 텍스트 감지
 # ─────────────────────────────────────────────
@@ -335,14 +389,20 @@ async def on_text_note(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 # ─────────────────────────────────────────────
 # 4. 매일 오전 9시 점검 + 멘션
 # ─────────────────────────────────────────────
-async def _run_missing_check(context: ContextTypes.DEFAULT_TYPE, window_start, window_end, message: str) -> bool:
-    """지정된 구간에 이미지를 안 올린 참가자를 찾아 멘션. 하나라도 보냈으면 True 반환."""
+async def _run_missing_check(
+    context: ContextTypes.DEFAULT_TYPE, window_start, window_end, message: str, mission_date, ignore_holiday: bool = False
+) -> bool:
+    """지정된 구간에 이미지를 안 올린 참가자를 찾아 멘션. 하나라도 보냈으면 True 반환.
+    해당 그룹이 mission_date를 휴무로 등록했으면 그 그룹은 건너뜀 (ignore_holiday=True면 무시하고 강제 실행)."""
     chat_ids = db_execute(
         "SELECT DISTINCT chat_id FROM participants WHERE active=1", fetch=True
     )
 
     sent_any = False
     for (chat_id,) in chat_ids:
+        if not ignore_holiday and _is_holiday(chat_id, mission_date):
+            continue
+
         participants = db_execute(
             "SELECT user_id, username, full_name FROM participants WHERE chat_id=? AND active=1",
             (chat_id,),
@@ -380,6 +440,7 @@ async def check_and_mention(context: ContextTypes.DEFAULT_TYPE) -> None:
     어제가 월/수/금/일이었다면 '전날 오후 3시 ~ 오늘 오전 7시' 구간에
     사진(이미지)을 한 장도 올리지 않은 활성 참가자를 멘션한다.
     동영상은 인정하지 않음 (photo 핸들러만 업로드로 기록하므로 자동으로 제외됨)
+    어제가 휴무로 등록되어 있으면(그룹별) 그 그룹은 건너뜀
     """
     now = datetime.now(KST)
     yesterday = (now - timedelta(days=1)).date()
@@ -390,7 +451,7 @@ async def check_and_mention(context: ContextTypes.DEFAULT_TYPE) -> None:
     window_end = now.replace(hour=CHECK_HOUR, minute=CHECK_MINUTE, second=0, microsecond=0)
     window_start = datetime.combine(yesterday, time(15, 0), tzinfo=KST)
 
-    await _run_missing_check(context, window_start, window_end, MENTION_MESSAGE)
+    await _run_missing_check(context, window_start, window_end, MENTION_MESSAGE, yesterday)
 
 
 async def midnight_reminder(context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -398,6 +459,7 @@ async def midnight_reminder(context: ContextTypes.DEFAULT_TYPE) -> None:
     월/수/금에서 다음날로 넘어가는 자정(00:00)에,
     그날 15시부터 지금(자정)까지 아직 이미지를 안 올린 참가자에게
     미리 리마인드 메시지를 보낸다. (최종 점검은 아침 7시에 별도로 나감)
+    오늘이 휴무로 등록되어 있으면(그룹별) 그 그룹은 건너뜀
     """
     now = datetime.now(KST)
     # run_daily가 00:00에 실행되므로, 방금 끝난 미션 날짜는 하루 전으로 계산
@@ -409,7 +471,7 @@ async def midnight_reminder(context: ContextTypes.DEFAULT_TYPE) -> None:
     window_start = datetime.combine(mission_day, time(15, 0), tzinfo=KST)
     window_end = now
 
-    await _run_missing_check(context, window_start, window_end, REMINDER_MESSAGE)
+    await _run_missing_check(context, window_start, window_end, REMINDER_MESSAGE, mission_day)
 
 
 async def weekly_worst_report(context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -440,6 +502,9 @@ async def weekly_worst_report(context: ContextTypes.DEFAULT_TYPE) -> None:
         miss_counts = {p[0]: 0 for p in participants}
 
         for mission_date in mission_dates:
+            if _is_holiday(chat_id, mission_date):
+                continue  # 휴무로 등록된 날은 누락 집계에서 제외
+
             window_start = datetime.combine(mission_date, time(15, 0), tzinfo=KST)
             window_end = datetime.combine(
                 mission_date + timedelta(days=1), time(CHECK_HOUR, CHECK_MINUTE), tzinfo=KST
@@ -535,9 +600,15 @@ async def manual_check(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     window_start = datetime.combine(yesterday, time(15, 0), tzinfo=KST)
 
     is_off_day = yesterday.weekday() in SKIP_WEEKDAYS
-    sent = await _run_missing_check(context, window_start, window_end, MENTION_MESSAGE)
+    is_holiday = _is_holiday(update.effective_chat.id, yesterday)
+    sent = await _run_missing_check(context, window_start, window_end, MENTION_MESSAGE, yesterday, ignore_holiday=True)
 
-    note = f" (참고: 어제({_WEEKDAY_NAMES[yesterday.weekday()]})는 원래 미션이 없는 날이라 실제 자동 점검은 건너뜁니다. 지금은 테스트라 강제로 실행했어요.)" if is_off_day else ""
+    notes = []
+    if is_off_day:
+        notes.append(f"어제({_WEEKDAY_NAMES[yesterday.weekday()]})는 원래 미션이 없는 날")
+    if is_holiday:
+        notes.append("어제는 휴무로 등록되어 있음")
+    note = f" (참고: {', '.join(notes)}이라 실제 자동 점검은 건너뜁니다. 지금은 테스트라 강제로 실행했어요.)" if notes else ""
     result = "미업로드자가 있어 메시지를 보냈습니다." if sent else "미업로드자가 없습니다."
     await update.message.reply_text(f"점검을 완료했습니다. {result}{note}")
 
@@ -557,9 +628,15 @@ async def manual_reminder(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     window_end = now
 
     is_off_day = mission_day.weekday() not in REMINDER_WEEKDAYS
-    sent = await _run_missing_check(context, window_start, window_end, REMINDER_MESSAGE)
+    is_holiday = _is_holiday(update.effective_chat.id, mission_day)
+    sent = await _run_missing_check(context, window_start, window_end, REMINDER_MESSAGE, mission_day, ignore_holiday=True)
 
-    note = f" (참고: 오늘({_WEEKDAY_NAMES[mission_day.weekday()]})은 원래 리마인드가 없는 날이라 실제 자동 발송은 건너뜁니다. 지금은 테스트라 강제로 실행했어요.)" if is_off_day else ""
+    notes = []
+    if is_off_day:
+        notes.append(f"오늘({_WEEKDAY_NAMES[mission_day.weekday()]})은 원래 리마인드가 없는 날")
+    if is_holiday:
+        notes.append("오늘은 휴무로 등록되어 있음")
+    note = f" (참고: {', '.join(notes)}이라 실제 자동 발송은 건너뜁니다. 지금은 테스트라 강제로 실행했어요.)" if notes else ""
     result = "미업로드자가 있어 메시지를 보냈습니다." if sent else "미업로드자가 없습니다."
     await update.message.reply_text(f"리마인드를 완료했습니다. {result}{note}")
 
@@ -608,6 +685,12 @@ def main() -> None:
 
     app.add_handler(CommandHandler("rank", manual_weekly, filters=allowed_chat_filter))
     app.add_handler(MessageHandler(filters.Regex(r"^/?순위$") & allowed_chat_filter, manual_weekly))
+
+    app.add_handler(CommandHandler("holiday", mark_holiday, filters=allowed_chat_filter))
+    app.add_handler(MessageHandler(filters.Regex(r"^/?휴무$") & allowed_chat_filter, mark_holiday))
+
+    app.add_handler(CommandHandler("unholiday", unmark_holiday, filters=allowed_chat_filter))
+    app.add_handler(MessageHandler(filters.Regex(r"^/?휴무해제$") & allowed_chat_filter, unmark_holiday))
 
     app.add_handler(MessageHandler(filters.PHOTO & allowed_chat_filter, on_photo))
 
