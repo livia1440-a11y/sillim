@@ -46,7 +46,7 @@ DB_PATH = os.environ.get("DB_PATH", "photo_bot.db")
 CHECK_HOUR, CHECK_MINUTE = 7, 0
 
 # 미션이 없는 요일 (Python weekday: 월=0, 화=1, 수=2, 목=3, 금=4, 토=5, 일=6)
-SKIP_WEEKDAYS = {1, 3, 5}  # 화, 목, 토 — 이 요일 몫은 점검하지 않음
+SKIP_WEEKDAYS = {1, 3, 5, 6}  # 화, 목, 토, 일 — 이 요일 몫은 점검하지 않음
 
 # 미업로드자 멘션 뒤에 붙일 멘트 (Railway Variables의 MENTION_MESSAGE로 실제 문구를 설정하세요.
 #  코드에는 조직 특유의 표현을 남기지 않기 위해 중립적인 기본값만 둡니다.)
@@ -432,12 +432,12 @@ async def _run_missing_check(
 
 async def check_and_mention(context: ContextTypes.DEFAULT_TYPE) -> None:
     """
-    미션 요일: 월/수/금/일 (취침 전까지 이미지 업로드)
-    화/목/토는 미션이 없는 날이라 점검하지 않음
+    미션 요일: 월/수/금 (취침 전까지 이미지 업로드, 일요일은 자율)
+    화/목/토/일은 미션이 없는 날이라 점검하지 않음
 
     매일 아침 점검은 '어제' 몫을 확인하는 것이므로,
-    어제가 화/목/토(미션 없는 날)였다면 이번 점검은 건너뜀.
-    어제가 월/수/금/일이었다면 '전날 오후 3시 ~ 오늘 오전 7시' 구간에
+    어제가 화/목/토/일(미션 없는 날)였다면 이번 점검은 건너뜀.
+    어제가 월/수/금이었다면 '전날 오후 3시 ~ 오늘 오전 7시' 구간에
     사진(이미지)을 한 장도 올리지 않은 활성 참가자를 멘션한다.
     동영상은 인정하지 않음 (photo 핸들러만 업로드로 기록하므로 자동으로 제외됨)
     어제가 휴무로 등록되어 있으면(그룹별) 그 그룹은 건너뜀
@@ -476,8 +476,9 @@ async def midnight_reminder(context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def weekly_worst_report(context: ContextTypes.DEFAULT_TYPE) -> None:
     """
-    매주 월요일 오전 7시, 지난 한 주(지난주 월/수/금/일)의 미션 누락 횟수를 집계해서
+    매주 월요일 오전 7시, 지난 한 주(지난주 월/수/금)의 미션 누락 횟수를 집계해서
     가장 많이 누락한 1~3등을 발표한다. 누락자가 아예 없으면 칭찬 메시지를 보낸다.
+    (일요일은 자율 업로드라 집계에서 제외)
     """
     now = datetime.now(KST)
     this_monday = now.date()
@@ -485,7 +486,6 @@ async def weekly_worst_report(context: ContextTypes.DEFAULT_TYPE) -> None:
         this_monday - timedelta(days=7),  # 지난주 월요일
         this_monday - timedelta(days=5),  # 지난주 수요일
         this_monday - timedelta(days=3),  # 지난주 금요일
-        this_monday - timedelta(days=1),  # 어제(일요일)
     ]
 
     chat_ids = db_execute(
