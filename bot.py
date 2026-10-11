@@ -43,7 +43,7 @@ KST = ZoneInfo("Asia/Seoul")
 DB_PATH = os.environ.get("DB_PATH", "photo_bot.db")
 
 # 매일 몇 시에 점검 메시지를 보낼지
-CHECK_HOUR, CHECK_MINUTE = 7, 0
+CHECK_HOUR, CHECK_MINUTE = 10, 0
 
 # 미션이 없는 요일 (Python weekday: 월=0, 화=1, 수=2, 목=3, 금=4, 토=5, 일=6)
 SKIP_WEEKDAYS = {1, 3, 5, 6}  # 화, 목, 토, 일 — 이 요일 몫은 점검하지 않음
@@ -57,7 +57,7 @@ REMINDER_HOUR, REMINDER_MINUTE = 0, 0
 REMINDER_MESSAGE = os.environ.get("REMINDER_MESSAGE", '취침 전까지 "자가피드백" 잊지 마세요❤️')
 REMINDER_WEEKDAYS = {0, 2, 4}  # 월, 수, 금 — 이 요일에서 다음날로 넘어가는 자정에 리마인드
 
-# 매주 월요일 07:00 "보고누락왕" 순위에서, 3등 점수와 동점자가 이 숫자보다 많으면 3등은 발표하지 않음
+# 매주 월요일 10:00 "보고누락왕" 순위에서, 3등 점수와 동점자가 이 숫자보다 많으면 3등은 발표하지 않음
 WEEKLY_RANK_TIE_LIMIT = 5
 
 # 이 봇이 동작할 그룹만 허용 (쉼표로 구분된 chat_id 목록). 비워두면 모든 그룹에서 동작(기존과 동일).
@@ -437,7 +437,7 @@ async def check_and_mention(context: ContextTypes.DEFAULT_TYPE) -> None:
 
     매일 아침 점검은 '어제' 몫을 확인하는 것이므로,
     어제가 화/목/토/일(미션 없는 날)였다면 이번 점검은 건너뜀.
-    어제가 월/수/금이었다면 '전날 오후 3시 ~ 오늘 오전 7시' 구간에
+    어제가 월/수/금이었다면 '전날 오후 3시 ~ 오늘 오전 10시' 구간에
     사진(이미지)을 한 장도 올리지 않은 활성 참가자를 멘션한다.
     동영상은 인정하지 않음 (photo 핸들러만 업로드로 기록하므로 자동으로 제외됨)
     어제가 휴무로 등록되어 있으면(그룹별) 그 그룹은 건너뜀
@@ -458,7 +458,7 @@ async def midnight_reminder(context: ContextTypes.DEFAULT_TYPE) -> None:
     """
     월/수/금에서 다음날로 넘어가는 자정(00:00)에,
     그날 15시부터 지금(자정)까지 아직 이미지를 안 올린 참가자에게
-    미리 리마인드 메시지를 보낸다. (최종 점검은 아침 7시에 별도로 나감)
+    미리 리마인드 메시지를 보낸다. (최종 점검은 다음날 오전 10시에 별도로 나감)
     오늘이 휴무로 등록되어 있으면(그룹별) 그 그룹은 건너뜀
     """
     now = datetime.now(KST)
@@ -474,24 +474,87 @@ async def midnight_reminder(context: ContextTypes.DEFAULT_TYPE) -> None:
     await _run_missing_check(context, window_start, window_end, REMINDER_MESSAGE, mission_day)
 
 
-async def weekly_worst_report(context: ContextTypes.DEFAULT_TYPE) -> None:
+def _week_mission_dates(now):
     """
-    매주 월요일 오전 7시, 지난 한 주(지난주 월/수/금)의 미션 누락 횟수를 집계해서
-    가장 많이 누락한 1~3등을 발표한다. 누락자가 아예 없으면 칭찬 메시지를 보낸다.
-    (일요일은 자율 업로드라 집계에서 제외)
+    '미션 구간이 전부 끝난 가장 최근의 한 주'의 미션 날짜(월/수/금)를 돌려준다.
+    금요일 미션은 토요일 아침 점검 시각에 끝나므로, 그 시각 이후면 이번 주,
+    그 전이면 지난주를 집계한다. (월요일 아침 자동 실행 = 방금 끝난 한 주,
+    수동 테스트도 같은 기준이라 '월요일에 실제로 발표될 내용'과 일치)
     """
-    now = datetime.now(KST)
-    this_monday = now.date()
-    mission_dates = [
-        this_monday - timedelta(days=7),  # 지난주 월요일
-        this_monday - timedelta(days=5),  # 지난주 수요일
-        this_monday - timedelta(days=3),  # 지난주 금요일
-    ]
+    monday = now.date() - timedelta(days=now.weekday())
+    week_done_at = datetime.combine(
+        monday + timedelta(days=5), time(CHECK_HOUR, CHECK_MINUTE), tzinfo=KST
+    )
+    if now < week_done_at:
+        monday -= timedelta(days=7)
+    return [monday, monday + timedelta(days=2), monday + timedelta(days=4)]
+
+
+def _fmt_date(d) -> str:
+    return f"{d.month}/{d.day}({_WEEKDAY_NAMES[d.weekday()]})"
+
+
+def _weekly_misses(chat_id: int, participants, mission_dates):
+    """
+    참가자별로 '누락한 날짜 목록'을 계산한다.
+    - 사진 또는 '사유' 메시지가 해당 구간(미션일 15:00 ~ 다음날 점검시각)에 하나라도 있으면 보고한 것으로 봄
+    - 휴무 등록일은 제외
+    - 봇이 기록을 시작하기 전 구간(그 그룹의 첫 기록보다 앞선 날짜)은 판단할 수 없으므로 제외
+    반환: (참가자별 누락 날짜 dict, 실제로 판정한 날짜 목록)
+    """
+    missed = {p[0]: [] for p in participants}
+    evaluated = []
+
+    first_row = db_execute(
+        "SELECT MIN(uploaded_at) FROM uploads WHERE chat_id=?", (chat_id,), fetch=True
+    )
+    first_record = first_row[0][0] if first_row and first_row[0][0] else None
+
+    for mission_date in mission_dates:
+        if _is_holiday(chat_id, mission_date):
+            continue
+
+        window_start = datetime.combine(mission_date, time(15, 0), tzinfo=KST)
+        window_end = datetime.combine(
+            mission_date + timedelta(days=1), time(CHECK_HOUR, CHECK_MINUTE), tzinfo=KST
+        )
+        if first_record is None or window_end.isoformat() <= first_record:
+            continue  # 이 날짜는 봇이 기록을 시작하기 전이라 판단 불가
+
+        evaluated.append(mission_date)
+        reported_ids = {
+            row[0]
+            for row in db_execute(
+                """
+                SELECT DISTINCT user_id FROM uploads
+                WHERE chat_id=? AND uploaded_at >= ? AND uploaded_at < ?
+                """,
+                (chat_id, window_start.isoformat(), window_end.isoformat()),
+                fetch=True,
+            )
+        }
+        for uid in missed:
+            if uid not in reported_ids:
+                missed[uid].append(mission_date)
+
+    return missed, evaluated
+
+
+async def weekly_worst_report(context: ContextTypes.DEFAULT_TYPE, now=None) -> bool:
+    """
+    매주 월요일 오전 10시, 지난 한 주(월/수/금)의 미션 누락 횟수를 집계해서
+    가장 많이 누락한 1~3등을 '누락한 날짜'와 함께 발표한다.
+    누락자가 아예 없으면 칭찬 메시지를 보낸다. (일요일은 자율 업로드라 집계에서 제외)
+    판정할 수 있는 기록이 없는 그룹은 발표하지 않는다. 하나라도 발표했으면 True 반환.
+    """
+    now = now or datetime.now(KST)
+    mission_dates = _week_mission_dates(now)
 
     chat_ids = db_execute(
         "SELECT DISTINCT chat_id FROM participants WHERE active=1", fetch=True
     )
 
+    sent_any = False
     for (chat_id,) in chat_ids:
         participants = db_execute(
             "SELECT user_id, username, full_name FROM participants WHERE chat_id=? AND active=1",
@@ -499,57 +562,41 @@ async def weekly_worst_report(context: ContextTypes.DEFAULT_TYPE) -> None:
             fetch=True,
         )
         name_map = {p[0]: p for p in participants}
-        miss_counts = {p[0]: 0 for p in participants}
+        missed_by_user, evaluated = _weekly_misses(chat_id, participants, mission_dates)
 
-        for mission_date in mission_dates:
-            if _is_holiday(chat_id, mission_date):
-                continue  # 휴무로 등록된 날은 누락 집계에서 제외
+        if not evaluated:
+            logger.info("주간 집계 건너뜀(chat_id=%s): 판정 가능한 미션일 없음", chat_id)
+            continue
 
-            window_start = datetime.combine(mission_date, time(15, 0), tzinfo=KST)
-            window_end = datetime.combine(
-                mission_date + timedelta(days=1), time(CHECK_HOUR, CHECK_MINUTE), tzinfo=KST
-            )
-            uploaded_ids = {
-                row[0]
-                for row in db_execute(
-                    """
-                    SELECT DISTINCT user_id FROM uploads
-                    WHERE chat_id=? AND uploaded_at >= ? AND uploaded_at < ?
-                    """,
-                    (chat_id, window_start.isoformat(), window_end.isoformat()),
-                    fetch=True,
-                )
-            }
-            for uid in miss_counts:
-                if uid not in uploaded_ids:
-                    miss_counts[uid] += 1
-
-        missers = [(uid, cnt) for uid, cnt in miss_counts.items() if cnt > 0]
+        # 누락이 1번이라도 있는 사람만 대상
+        missers = [(uid, dates) for uid, dates in missed_by_user.items() if dates]
 
         if not missers:
             await context.bot.send_message(
                 chat_id,
                 "이번 주는 모두 자가피드백을 성실히 완료하셨어요! 정말 잘하셨습니다👏🎉",
             )
+            sent_any = True
             continue
 
         # 누락 횟수 내림차순, 동점이면 이름 가나다순으로 정렬해서 순위를 매김
-        missers.sort(key=lambda x: (-x[1], name_map[x[0]][2] or ""))
+        missers.sort(key=lambda x: (-len(x[1]), name_map[x[0]][2] or ""))
 
         top = missers[:3]
         if len(missers) >= 3:
-            third_count = missers[2][1]
-            tie_count = sum(1 for _, c in missers if c == third_count)
+            third_count = len(missers[2][1])
+            tie_count = sum(1 for _, d in missers if len(d) == third_count)
             if tie_count > WEEKLY_RANK_TIE_LIMIT:
                 # 3등 동점자가 너무 많으면 3등은 통째로 제외하고 1,2등만 발표
-                top = [x for x in missers if x[1] != third_count][:2] or missers[:2]
+                top = [x for x in missers if len(x[1]) != third_count][:2] or missers[:2]
 
         lines = []
-        for rank, (uid, cnt) in enumerate(top, start=1):
+        for rank, (uid, dates) in enumerate(top, start=1):
             _, username, full_name = name_map[uid]
             name = escape(full_name or (f"@{username}" if username else str(uid)))
             mention = f'<a href="tg://user?id={uid}">{name}</a>'
-            lines.append(f"{rank}. {mention}")
+            missed_text = ", ".join(_fmt_date(d) for d in sorted(dates))
+            lines.append(f"{rank}. {mention} — {missed_text} 누락")
 
         text = (
             "보고누락왕 순위를 발표합니다..!🥲\n\n"
@@ -557,6 +604,9 @@ async def weekly_worst_report(context: ContextTypes.DEFAULT_TYPE) -> None:
             + "\n\n이번주는 모두 분발 부탁드립니다💪🏻"
         )
         await context.bot.send_message(chat_id, text, parse_mode=ParseMode.HTML)
+        sent_any = True
+
+    return sent_any
 
 
 async def _send_mentions(context, chat_id, missing_users, message: str) -> None:
@@ -650,8 +700,15 @@ async def manual_weekly(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         await update.message.reply_text("관리자만 사용할 수 있는 명령어예요.")
         return
 
-    await weekly_worst_report(context)
-    await update.message.reply_text("주간 집계를 완료했습니다.")
+    sent = await weekly_worst_report(context)
+    dates = _week_mission_dates(datetime.now(KST))
+    period = ", ".join(_fmt_date(d) for d in dates)
+    if sent:
+        await update.message.reply_text(f"주간 집계를 완료했습니다. (집계 대상 미션일: {period})")
+    else:
+        await update.message.reply_text(
+            f"집계 대상 미션일({period})에 봇이 기록한 내용이 없어 발표하지 않았어요."
+        )
 
 
 # ─────────────────────────────────────────────
@@ -713,7 +770,7 @@ def main() -> None:
     # 예외는 서버 로그에만 남기고 사용자에게 세부 내용을 노출하지 않음
     app.add_error_handler(on_error)
 
-    # 매일 07:00(KST) 최종 점검 + 멘션
+    # 매일 10:00(KST) 최종 점검 + 멘션
     app.job_queue.run_daily(
         check_and_mention,
         time=time(CHECK_HOUR, CHECK_MINUTE, tzinfo=KST),
@@ -725,11 +782,11 @@ def main() -> None:
         time=time(REMINDER_HOUR, REMINDER_MINUTE, tzinfo=KST),
     )
 
-    # 매주 월요일 07:00(KST) 주간 누락왕 발표
+    # 매주 월요일 10:00(KST) 주간 누락왕 발표
     app.job_queue.run_daily(
         weekly_worst_report,
         time=time(CHECK_HOUR, CHECK_MINUTE, tzinfo=KST),
-        days=(0,),  # 0 = 월요일
+        days=(1,),  # PTB v20+ 요일 번호: 0=일요일, 1=월요일
     )
 
     logger.info("봇을 시작합니다...")
